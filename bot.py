@@ -274,21 +274,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------- Core Initialization Execution -----------------
+import time
+
 def main():
     if not TOKEN:
         logger.critical("FATAL error: TELEGRAM_BOT_TOKEN environment variable is missing!")
         return
 
+    # 1. Start the health check web server IMMEDIATELY.
+    # This immediately satisfies Render so it knows the container is online.
     start_health_check()
+    logger.info("🚀 Health check web server running on port 10000.")
 
+    # 2. FORCE A DEPLOYMENT PAUSE
+    # We sleep for 60 seconds here. The web server stays responsive in the background 
+    # thread, but our main thread waits out Render's old container teardown period.
+    logger.info("⏳ Pausing for 60 seconds to allow Render to terminate the old container...")
+    time.sleep(60)
+    logger.info("▶️ Pause complete. Initializing Telegram application instance...")
+
+    # 3. Initialize and start the Telegram engine safely
     application = ApplicationBuilder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Bot components generated successfully. High-availability routing applied.")
-    
+    logger.info("✅ Bot infrastructure fully online. Starting polling loops.")
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
