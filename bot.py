@@ -4,6 +4,7 @@ import html
 import threading
 import http.server
 import socketserver
+import urllib.parse
 import httpx
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import (
@@ -75,14 +76,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes search queries typed by the user."""
+    """Processes search queries typed by the user with proper URL encoding."""
     query = update.message.text.strip()
     if not query:
         return
 
     status_msg = await update.message.reply_text(f"🔍 Searching for <i>'{html.escape(query)}'</i>...", parse_mode="HTML")
     
-    data = await api_get(f"/players/search/{query}")
+    # FIX: Explicitly URL-encode spaces and special characters (e.g., "Lamine Yamal" -> "Lamine%20Yamal")
+    safe_query = urllib.parse.quote(query)
+    
+    data = await api_get(f"/players/search/{safe_query}")
     players = data.get("results", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
 
     if not players:
