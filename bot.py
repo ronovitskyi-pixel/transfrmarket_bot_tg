@@ -5,7 +5,6 @@ import threading
 import http.server
 import socketserver
 import httpx
-import urllib.parse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import (
     ApplicationBuilder,
@@ -52,7 +51,7 @@ def start_health_check():
 
 # ----------------- Transfermarkt API Helpers -----------------
 async def api_get(endpoint: str, params: dict = None) -> dict:
-    """Helper to safely handle asynchronous API requests."""
+    """Helper to safely handle asynchronous API requests with proper query structures."""
     url = f"{API_BASE_URL}{endpoint}"
     async with httpx.AsyncClient() as client:
         try:
@@ -76,17 +75,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes search queries typed by the user using proper query string routing."""
+    """Processes search queries typed by the user using clean parameter bindings."""
     query = update.message.text.strip()
     if not query:
         return
 
     status_msg = await update.message.reply_text(f"🔍 Searching for <i>'{html.escape(query)}'</i>...", parse_mode="HTML")
     
-    # FIX: Use explicit query parameters pattern required by the search route
+    # FIX: Pass the payload via the 'params' argument. This safely auto-encodes strings 
+    # and structures the URL precisely how the Vercel API expects it (?query=Lamine+Yamal)
     data = await api_get("/players/search", params={"query": query})
     
-    # Safely digest responses whether wrapped in 'results' or serving a top-level list
     players = []
     if isinstance(data, dict):
         players = data.get("results", [])
@@ -293,9 +292,9 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Bot infrastructure running cleanly.")
+    logger.info("Bot infrastructure running cleanly with core URL fixes.")
     
-    # FIX: drop_pending_updates=True clears previous conflicting sessions instantly during deployment
+    # FIX: drop_pending_updates=True drops hanging requests to prevent 409 Conflict clashes
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
