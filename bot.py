@@ -27,7 +27,7 @@ API_BASE_URL = os.environ.get("TRANSFERMARKT_API_URL", "https://transfermarkt-ap
 
 # ----------------- Render Health Check Server -----------------
 def start_health_check():
-    """Starts a lightweight web server to satisfy Render's port binding health checks."""
+    """Starts a lightweight web server immediately to pass Render checks."""
     class HealthHandler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):
             if self.path == "/":
@@ -40,7 +40,7 @@ def start_health_check():
                 self.end_headers()
 
     def run_server():
-        port = int(os.environ.get("PORT", 8080))
+        port = int(os.environ.get("PORT", 10000))  # Match Render's expected port
         socketserver.TCPServer.allow_reuse_address = True
         with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
             logger.info(f"Health check server serving on port {port}")
@@ -51,7 +51,7 @@ def start_health_check():
 
 # ----------------- Transfermarkt API Helpers -----------------
 async def api_get(endpoint: str, params: dict = None) -> dict:
-    """Helper to safely handle asynchronous API requests with proper query structures."""
+    """Helper to safely handle asynchronous API requests."""
     url = f"{API_BASE_URL}{endpoint}"
     async with httpx.AsyncClient() as client:
         try:
@@ -75,20 +75,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes search queries typed by the user using clean parameter bindings."""
+    """Processes queries with deep fallback tree parsing logic to catch players."""
     query = update.message.text.strip()
     if not query:
         return
 
     status_msg = await update.message.reply_text(f"🔍 Searching for <i>'{html.escape(query)}'</i>...", parse_mode="HTML")
     
-    # FIX: Pass the payload via the 'params' argument. This safely auto-encodes strings 
-    # and structures the URL precisely how the Vercel API expects it (?query=Lamine+Yamal)
+    # Query structure targeted directly to the search router endpoint
     data = await api_get("/players/search", params={"query": query})
     
     players = []
     if isinstance(data, dict):
-        players = data.get("results", [])
+        # Scan across all potential nesting permutations used by alternative versions of the scraping engine
+        players = data.get("results") or data.get("players") or data.get("resultsList") or []
     elif isinstance(data, list):
         players = data
 
@@ -103,6 +103,7 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def render_results_list(message, players):
     """Generates an interactive inline grid listing found players."""
     keyboard = []
+    # Safeguard slices up to 10 entries to bypass maximum callback text payload constraints
     for p in players[:10]:
         p_id = p.get('id')
         p_name = p.get('name', 'Unknown Player')
@@ -155,7 +156,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lp_options = LinkPreviewOptions(is_disabled=False, prefer_large_media=True, show_above_text=True) if image_url else None
     image_prefix = f'<a href="{image_url}">&#8205;</a>' if image_url else ""
 
-    # Event: Player Selected
     if data.startswith("sel_"):
         selected_id = data.split("_", 1)[1]
         context.user_data['current_player_id'] = selected_id
@@ -165,14 +165,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         profile_data = await api_get(f"/players/{selected_id}/profile")
         
         matched_name = profile_data.get('name', 'Selected Player')
-        found_image = profile_data.get('imageURL') or profile_data.get('imageUrl', '')
+        # Deep inspection to cleanly fetch player headshots across changing property schemas
+        found_image = profile_data.get('imageURL') or profile_data.get('imageUrl') or profile_data.get('image_url', '')
         
         context.user_data['current_player_name'] = matched_name
         context.user_data['current_player_image'] = found_image
         
         await render_player_menu(query.message, matched_name, found_image)
 
-    # Event: View Transfer History
     elif data == "view_transfers":
         if not player_id:
             await query.message.edit_text("❌ Session data lost. Please search again.")
@@ -180,7 +180,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"{image_prefix}🔄 <b>Transfer History: {html.escape(player_name)}</b>\n\n"
         api_data = await api_get(f"/players/{player_id}/transfers")
-        transfers = api_data.get("transfers", []) if isinstance(api_data, dict) else []
+        transfers = api_data.get("transfers") if isinstance(api_data, dict) else []
 
         if not transfers:
             text += "<i>No record of transfers discovered for this player.</i>"
@@ -208,7 +208,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("🔙 Back to Player Menu", callback_data="nav_player")]]
         await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), link_preview_options=lp_options)
 
-    # Event: View Trophies Won
     elif data == "view_trophies":
         if not player_id:
             await query.message.edit_text("❌ Session data lost. Please search again.")
@@ -216,7 +215,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"{image_prefix}🏆 <b>Achievements: {html.escape(player_name)}</b>\n\n"
         api_data = await api_get(f"/players/{player_id}/achievements")
-        achievements = api_data.get("achievements", []) if isinstance(api_data, dict) else []
+        achievements = api_data.get("achievements") if isinstance(api_data, dict) else []
 
         if not achievements:
             text += "<i>No records of standard titles or personal awards found.</i>"
@@ -231,7 +230,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("🔙 Back to Player Menu", callback_data="nav_player")]]
         await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), link_preview_options=lp_options)
 
-    # Event: View Stats & Goals
     elif data == "view_stats":
         if not player_id:
             await query.message.edit_text("❌ Session data lost. Please search again.")
@@ -239,7 +237,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         text = f"{image_prefix}📊 <b>Performance Stats: {html.escape(player_name)}</b>\n\n"
         api_data = await api_get(f"/players/{player_id}/stats")
-        stats = api_data.get("stats", []) if isinstance(api_data, dict) else []
+        stats = api_data.get("stats") if isinstance(api_data, dict) else []
 
         if not stats:
             text += "<i>No metrics compiled for this player context.</i>"
@@ -265,11 +263,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("🔙 Back to Player Menu", callback_data="nav_player")]]
         await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), link_preview_options=lp_options)
 
-    # Navigation Event: Return to Menu Profile
     elif data == "nav_player":
         await render_player_menu(query.message, player_name, image_url)
 
-    # Navigation Event: Return to Main Search Results List
     elif data == "nav_results":
         players = context.user_data.get('last_search_results', [])
         if not players:
@@ -284,17 +280,19 @@ def main():
         logger.critical("FATAL error: TELEGRAM_BOT_TOKEN environment variable is missing!")
         return
 
+    # 1. Fire up the health server immediately to pass Render's port tracking tests
     start_health_check()
 
+    # 2. Build the app instance framework
     application = ApplicationBuilder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Bot infrastructure running cleanly with core URL fixes.")
+    logger.info("Bot components generated successfully.")
     
-    # FIX: drop_pending_updates=True drops hanging requests to prevent 409 Conflict clashes
+    # 3. Use drop_pending_updates=True to flush out old requests and prevent conflict clashes
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
