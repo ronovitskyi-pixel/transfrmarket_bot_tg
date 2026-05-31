@@ -4,8 +4,8 @@ import html
 import threading
 import http.server
 import socketserver
-import urllib.parse
 import httpx
+import urllib.parse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import (
     ApplicationBuilder,
@@ -51,12 +51,12 @@ def start_health_check():
 
 
 # ----------------- Transfermarkt API Helpers -----------------
-async def api_get(endpoint: str) -> dict:
+async def api_get(endpoint: str, params: dict = None) -> dict:
     """Helper to safely handle asynchronous API requests."""
     url = f"{API_BASE_URL}{endpoint}"
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, timeout=12.0)
+            response = await client.get(url, params=params, timeout=15.0)
             if response.status_code == 200:
                 return response.json()
             logger.warning(f"API returned status {response.status_code} for {url}")
@@ -76,21 +76,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Processes search queries typed by the user with proper URL encoding."""
+    """Processes search queries typed by the user using proper query string routing."""
     query = update.message.text.strip()
     if not query:
         return
 
     status_msg = await update.message.reply_text(f"🔍 Searching for <i>'{html.escape(query)}'</i>...", parse_mode="HTML")
     
-    # FIX: Explicitly URL-encode spaces and special characters (e.g., "Lamine Yamal" -> "Lamine%20Yamal")
-    safe_query = urllib.parse.quote(query)
+    # FIX: Use explicit query parameters pattern required by the search route
+    data = await api_get("/players/search", params={"query": query})
     
-    data = await api_get(f"/players/search/{safe_query}")
-    players = data.get("results", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    # Safely digest responses whether wrapped in 'results' or serving a top-level list
+    players = []
+    if isinstance(data, dict):
+        players = data.get("results", [])
+    elif isinstance(data, list):
+        players = data
 
     if not players:
-        await status_msg.edit_text("❌ No players found matching that name. Try another spelling.")
+        await status_msg.edit_text("❌ No players found matching that name. Try another spelling or common variation.")
         return
 
     context.user_data['last_search_results'] = players
@@ -108,7 +112,6 @@ async def render_results_list(message, players):
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"sel_{p_id}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    # Clear out previous dynamic image preview configurations when dropping back to standard textual menus
     await message.edit_text(
         "🎯 <b>Select a player to view details:</b>", 
         reply_markup=reply_markup, 
@@ -119,7 +122,6 @@ async def render_results_list(message, players):
 
 async def render_player_menu(message, player_name, image_url):
     """Displays the interactive submenu for a chosen player, embedding their face picture."""
-    # Injecting a zero-width space linked to the image forces Telegram to render it as a profile banner
     image_html = f'<a href="{image_url}">&#8205;</a>' if image_url else ""
     text = f"{image_html}👤 <b>Player Profile: {html.escape(player_name)}</b>\n\nChoose an option below to view details:"
     
@@ -151,7 +153,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     player_name = context.user_data.get('current_player_name', 'Player')
     image_url = context.user_data.get('current_player_image', '')
 
-    # Shared reusable preview layout mapping
     lp_options = LinkPreviewOptions(is_disabled=False, prefer_large_media=True, show_above_text=True) if image_url else None
     image_prefix = f'<a href="{image_url}">&#8205;</a>' if image_url else ""
 
@@ -162,7 +163,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await query.message.edit_text("⏳ Fetching live player profile...", link_preview_options=LinkPreviewOptions(is_disabled=True))
         
-        # Pull profile directly to capture exact portrait asset URL
         profile_data = await api_get(f"/players/{selected_id}/profile")
         
         matched_name = profile_data.get('name', 'Selected Player')
@@ -186,7 +186,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not transfers:
             text += "<i>No record of transfers discovered for this player.</i>"
         else:
-            for t in transfers[:6]:  # Safely constrained to stay within Telegram block length limits
+            for t in transfers[:6]:
                 season = t.get('season', 'N/A')
                 date = t.get('date', 'N/A')
                 
@@ -293,8 +293,10 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Bot infrastructure running with image rendering engine updates.")
-    application.run_polling()
+    logger.info("Bot infrastructure running cleanly.")
+    
+    # FIX: drop_pending_updates=True clears previous conflicting sessions instantly during deployment
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
