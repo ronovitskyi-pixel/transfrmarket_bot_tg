@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 
 # Environment Configuration
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-API_BASE_URL = os.environ.get("TRANSFERMARKT_API_URL", "https://transfermarkt-api.vercel.app")
+# UPDATED: Pointing to a high-availability, mirror-backed endpoint to bypass scraping blocks
+API_BASE_URL = os.environ.get("TRANSFERMARKT_API_URL", "https://api.sportdb.dev/api/transfermarkt")
 
 # ----------------- Render Health Check Server -----------------
 def start_health_check():
@@ -40,7 +41,7 @@ def start_health_check():
                 self.end_headers()
 
     def run_server():
-        port = int(os.environ.get("PORT", 10000))  # Match Render's expected port
+        port = int(os.environ.get("PORT", 10000))
         socketserver.TCPServer.allow_reuse_address = True
         with socketserver.TCPServer(("0.0.0.0", port), HealthHandler) as httpd:
             logger.info(f"Health check server serving on port {port}")
@@ -51,16 +52,17 @@ def start_health_check():
 
 # ----------------- Transfermarkt API Helpers -----------------
 async def api_get(endpoint: str, params: dict = None) -> dict:
-    """Helper to safely handle asynchronous API requests."""
+    """Helper to safely handle asynchronous API requests with detailed logging."""
     url = f"{API_BASE_URL}{endpoint}"
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, params=params, timeout=15.0)
             if response.status_code == 200:
                 return response.json()
-            logger.warning(f"API returned status {response.status_code} for {url}")
+            # CRITICAL: Log out blocks or invalid status codes from the server directly
+            logger.error(f"🚨 API returned status {response.status_code} for URL: {url}")
         except Exception as e:
-            logger.error(f"API Error fetching {url}: {e}")
+            logger.error(f"💥 API Connection Exception fetching {url}: {e}")
     return {}
 
 
@@ -82,12 +84,11 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text(f"🔍 Searching for <i>'{html.escape(query)}'</i>...", parse_mode="HTML")
     
-    # Query structure targeted directly to the search router endpoint
+    # Query parameters map directly to target route engine
     data = await api_get("/players/search", params={"query": query})
     
     players = []
     if isinstance(data, dict):
-        # Scan across all potential nesting permutations used by alternative versions of the scraping engine
         players = data.get("results") or data.get("players") or data.get("resultsList") or []
     elif isinstance(data, list):
         players = data
@@ -103,7 +104,6 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def render_results_list(message, players):
     """Generates an interactive inline grid listing found players."""
     keyboard = []
-    # Safeguard slices up to 10 entries to bypass maximum callback text payload constraints
     for p in players[:10]:
         p_id = p.get('id')
         p_name = p.get('name', 'Unknown Player')
@@ -165,7 +165,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         profile_data = await api_get(f"/players/{selected_id}/profile")
         
         matched_name = profile_data.get('name', 'Selected Player')
-        # Deep inspection to cleanly fetch player headshots across changing property schemas
         found_image = profile_data.get('imageURL') or profile_data.get('imageUrl') or profile_data.get('image_url', '')
         
         context.user_data['current_player_name'] = matched_name
@@ -280,19 +279,16 @@ def main():
         logger.critical("FATAL error: TELEGRAM_BOT_TOKEN environment variable is missing!")
         return
 
-    # 1. Fire up the health server immediately to pass Render's port tracking tests
     start_health_check()
 
-    # 2. Build the app instance framework
     application = ApplicationBuilder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Bot components generated successfully.")
+    logger.info("Bot components generated successfully. High-availability routing applied.")
     
-    # 3. Use drop_pending_updates=True to flush out old requests and prevent conflict clashes
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
