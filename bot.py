@@ -5,7 +5,7 @@ import threading
 import http.server
 import socketserver
 import httpx
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -23,7 +23,6 @@ logger = logging.getLogger(__name__)
 
 # Environment Configuration
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-# Defaulting to a common public community instance of the Transfermarkt API
 API_BASE_URL = os.environ.get("TRANSFERMARKT_API_URL", "https://transfermarkt-api.vercel.app")
 
 # ----------------- Render Health Check Server -----------------
@@ -70,8 +69,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Greets the user and gives instructions."""
     await update.message.reply_text(
         "⚽ <b>Welcome to the Transfermarkt Search Bot!</b>\n\n"
-        "Type a football player's name below to look up their current profile, "
-        "transfer history, awards, and club statistics.",
+        "Type a football player's name below to look up their profile, "
+        "face portrait, transfer history, awards, and club statistics.",
         parse_mode="HTML"
     )
 
@@ -83,15 +82,13 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text(f"🔍 Searching for <i>'{html.escape(query)}'</i>...", parse_mode="HTML")
     
-    # Target endpoint for standard open source transfermarkt-api
     data = await api_get(f"/players/search/{query}")
     players = data.get("results", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
 
     if not players:
-        await status_msg.edit_text("❌ No players found matching that name. Try a different variation.")
+        await status_msg.edit_text("❌ No players found matching that name. Try another spelling.")
         return
 
-    # Cache search results to contextual storage to manage state efficiently
     context.user_data['last_search_results'] = players
     await render_results_list(status_msg, players)
 
@@ -99,7 +96,6 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def render_results_list(message, players):
     """Generates an interactive inline grid listing found players."""
     keyboard = []
-    # Cap results at 10 to avoid payload weight issues
     for p in players[:10]:
         p_id = p.get('id')
         p_name = p.get('name', 'Unknown Player')
@@ -108,19 +104,36 @@ async def render_results_list(message, players):
         keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"sel_{p_id}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await message.edit_text("🎯 <b>Select a player to view details:</b>", reply_markup=reply_markup, parse_mode="HTML")
+    # Clear out previous dynamic image preview configurations when dropping back to standard textual menus
+    await message.edit_text(
+        "🎯 <b>Select a player to view details:</b>", 
+        reply_markup=reply_markup, 
+        parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True)
+    )
 
 
-async def render_player_menu(message, player_name):
-    """Displays the interactive submenu for a chosen player."""
-    text = f"👤 <b>Player Profile: {html.escape(player_name)}</b>\n\nChoose an option below to view details:"
+async def render_player_menu(message, player_name, image_url):
+    """Displays the interactive submenu for a chosen player, embedding their face picture."""
+    # Injecting a zero-width space linked to the image forces Telegram to render it as a profile banner
+    image_html = f'<a href="{image_url}">&#8205;</a>' if image_url else ""
+    text = f"{image_html}👤 <b>Player Profile: {html.escape(player_name)}</b>\n\nChoose an option below to view details:"
+    
     keyboard = [
         [InlineKeyboardButton("🔄 Transfer History", callback_data="view_transfers")],
         [InlineKeyboardButton("🏆 Trophies & Awards", callback_data="view_trophies")],
         [InlineKeyboardButton("📊 Statistics & Goals", callback_data="view_stats")],
         [InlineKeyboardButton("🔙 Back to Search Results", callback_data="nav_results")]
     ]
-    await message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    lp_options = LinkPreviewOptions(is_disabled=False, prefer_large_media=True, show_above_text=True) if image_url else None
+
+    await message.edit_text(
+        text, 
+        parse_mode="HTML", 
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        link_preview_options=lp_options
+    )
 
 
 # ----------------- Dynamic Callback Query Processing -----------------
@@ -132,21 +145,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     player_id = context.user_data.get('current_player_id')
     player_name = context.user_data.get('current_player_name', 'Player')
+    image_url = context.user_data.get('current_player_image', '')
+
+    # Shared reusable preview layout mapping
+    lp_options = LinkPreviewOptions(is_disabled=False, prefer_large_media=True, show_above_text=True) if image_url else None
+    image_prefix = f'<a href="{image_url}">&#8205;</a>' if image_url else ""
 
     # Event: Player Selected
     if data.startswith("sel_"):
         selected_id = data.split("_", 1)[1]
         context.user_data['current_player_id'] = selected_id
         
-        # Match name within cached search records
-        matched_name = "Selected Player"
-        if 'last_search_results' in context.user_data:
-            for p in context.user_data['last_search_results']:
-                if str(p.get('id')) == selected_id:
-                    matched_name = p.get('name', 'Player')
-                    break
+        await query.message.edit_text("⏳ Fetching live player profile...", link_preview_options=LinkPreviewOptions(is_disabled=True))
+        
+        # Pull profile directly to capture exact portrait asset URL
+        profile_data = await api_get(f"/players/{selected_id}/profile")
+        
+        matched_name = profile_data.get('name', 'Selected Player')
+        found_image = profile_data.get('imageURL') or profile_data.get('imageUrl', '')
+        
         context.user_data['current_player_name'] = matched_name
-        await render_player_menu(query.message, matched_name)
+        context.user_data['current_player_image'] = found_image
+        
+        await render_player_menu(query.message, matched_name, found_image)
 
     # Event: View Transfer History
     elif data == "view_transfers":
@@ -154,19 +175,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text("❌ Session data lost. Please search again.")
             return
 
-        await query.message.edit_text("🔄 Retrieving transfer logs...")
+        text = f"{image_prefix}🔄 <b>Transfer History: {html.escape(player_name)}</b>\n\n"
         api_data = await api_get(f"/players/{player_id}/transfers")
         transfers = api_data.get("transfers", []) if isinstance(api_data, dict) else []
 
-        text = f"🔄 <b>Transfer History: {html.escape(player_name)}</b>\n\n"
         if not transfers:
             text += "<i>No record of transfers discovered for this player.</i>"
         else:
-            for t in transfers[:8]:  # Keeping updates readable within text spaces
+            for t in transfers[:6]:  # Safely constrained to stay within Telegram block length limits
                 season = t.get('season', 'N/A')
                 date = t.get('date', 'N/A')
                 
-                # Dynamic parsing based on API nested dictionary vs string variant structures
                 f_club = t.get('from', {})
                 from_club = f_club.get('name', 'Unknown') if isinstance(f_club, dict) else t.get('from', 'Unknown')
                 t_club = t.get('to', {})
@@ -180,11 +199,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"├ ❌ <b>From:</b> {html.escape(from_club)}\n"
                     f"├ ✅ <b>To:</b> {html.escape(to_club)}\n"
                     f"├ 💰 <b>Fee:</b> {html.escape(fee)}\n"
-                    f"└ 📈 <b>MV at Transfer:</b> {html.escape(mv)}\n\n"
+                    f"└ 📈 <b>MV:</b> {html.escape(mv)}\n\n"
                 )
 
         keyboard = [[InlineKeyboardButton("🔙 Back to Player Menu", callback_data="nav_player")]]
-        await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), link_preview_options=lp_options)
 
     # Event: View Trophies Won
     elif data == "view_trophies":
@@ -192,15 +211,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text("❌ Session data lost. Please search again.")
             return
 
-        await query.message.edit_text("🏆 Retrieving trophies won...")
+        text = f"{image_prefix}🏆 <b>Achievements: {html.escape(player_name)}</b>\n\n"
         api_data = await api_get(f"/players/{player_id}/achievements")
         achievements = api_data.get("achievements", []) if isinstance(api_data, dict) else []
 
-        text = f"🏆 <b>Achievements & Trophies: {html.escape(player_name)}</b>\n\n"
         if not achievements:
-            text += "<i>No records of structural titles or personal awards found.</i>"
+            text += "<i>No records of standard titles or personal awards found.</i>"
         else:
-            for a in achievements:
+            for a in achievements[:12]:
                 title = a.get('title', a.get('achievement', 'Trophy'))
                 count = a.get('count', '1')
                 seasons_data = a.get('seasons', [])
@@ -208,7 +226,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"🥇 <b>{html.escape(title)}</b> (x{html.escape(str(count))})\n✨ <i>Years:</i> {html.escape(seasons or 'N/A')}\n\n"
 
         keyboard = [[InlineKeyboardButton("🔙 Back to Player Menu", callback_data="nav_player")]]
-        await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), link_preview_options=lp_options)
 
     # Event: View Stats & Goals
     elif data == "view_stats":
@@ -216,16 +234,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text("❌ Session data lost. Please search again.")
             return
 
-        await query.message.edit_text("📊 Compiling performance data...")
+        text = f"{image_prefix}📊 <b>Performance Stats: {html.escape(player_name)}</b>\n\n"
         api_data = await api_get(f"/players/{player_id}/stats")
         stats = api_data.get("stats", []) if isinstance(api_data, dict) else []
 
-        text = f"📊 <b>Performance Stats for {html.escape(player_name)}</b>\n\n"
         if not stats:
             text += "<i>No metrics compiled for this player context.</i>"
         else:
             if isinstance(stats, list):
-                for s in stats[:10]:
+                for s in stats[:8]:
                     comp_obj = s.get('competition', {})
                     comp = comp_obj.get('name', 'Unknown Comp') if isinstance(comp_obj, dict) else s.get('competition', 'Unknown Comp')
                     club_obj = s.get('club', {})
@@ -243,11 +260,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
 
         keyboard = [[InlineKeyboardButton("🔙 Back to Player Menu", callback_data="nav_player")]]
-        await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard), link_preview_options=lp_options)
 
     # Navigation Event: Return to Menu Profile
     elif data == "nav_player":
-        await render_player_menu(query.message, player_name)
+        await render_player_menu(query.message, player_name, image_url)
 
     # Navigation Event: Return to Main Search Results List
     elif data == "nav_results":
@@ -264,18 +281,15 @@ def main():
         logger.critical("FATAL error: TELEGRAM_BOT_TOKEN environment variable is missing!")
         return
 
-    # Fire up the health-check web server thread required by Render
     start_health_check()
 
-    # Instantiate Application pipeline configuration
     application = ApplicationBuilder().token(TOKEN).build()
 
-    # Establish routing mappings
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Bot infrastructure running. Commencing Long Polling loop...")
+    logger.info("Bot infrastructure running with image rendering engine updates.")
     application.run_polling()
 
 if __name__ == "__main__":
