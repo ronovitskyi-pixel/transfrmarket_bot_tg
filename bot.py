@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Environment Configuration
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 # UPDATED: Pointing to a high-availability, mirror-backed endpoint to bypass scraping blocks
-API_BASE_URL = os.environ.get("TRANSFERMARKT_API_URL", "https://api.sportdb.dev/api/transfermarkt")
+API_BASE_URL = "https://www.thesportsdb.com/api/v1/json/3"
 
 # ----------------- Render Health Check Server -----------------
 def start_health_check():
